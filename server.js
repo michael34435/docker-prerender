@@ -49,6 +49,7 @@ class LRUCache {
   keys(){ return [...this.map.keys()]; }
 }
 const cache = new LRUCache(CACHE_MAX_ENTRIES, CACHE_TTL_MS);
+const markdownCacheKey = (url) => `markdown:${url}`;
 
 // === Playwright 基礎 ===
 let browser;
@@ -61,7 +62,7 @@ async function ensureBrowser() {
   }
 }
 
-async function render(url) {
+async function render(url, asMarkdown = false) {
   await ensureBrowser();
   const ctx = await browser.newContext({
     userAgent: 'Mozilla/5.0 (compatible; PlaywrightPrerender/1.1)',
@@ -76,19 +77,21 @@ async function render(url) {
 
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: READY_TIMEOUT });
 
-  const ok = await Promise.race([
-    page.waitForFunction((sel) => {
-      const title = (document.querySelector('title')?.textContent || document.title || '').trim();
-      console.log(`Detected title: "${title}"`);
-      if (title.length > 0) return true;
-      const app = document.querySelector('#app');
-      console.log(`Detected app element: ${app ? 'YES' : 'NO'}`);
-      return !!app && (app.children.length > 0 || !!document.querySelector(sel));
-    }, READY_SELECTOR, { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false),
-    page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false),
-  ]);
+  const ok = asMarkdown
+    ? await page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false)
+    : await Promise.race([
+      page.waitForFunction((sel) => {
+        const title = (document.querySelector('title')?.textContent || document.title || '').trim();
+        console.log(`Detected title: "${title}"`);
+        if (title.length > 0) return true;
+        const app = document.querySelector('#app');
+        console.log(`Detected app element: ${app ? 'YES' : 'NO'}`);
+        return !!app && (app.children.length > 0 || !!document.querySelector(sel));
+      }, READY_SELECTOR, { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false),
+      page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false),
+    ]);
 
-  if (ok) await page.waitForTimeout(SETTLE_MS);
+  if (ok || asMarkdown) await page.waitForTimeout(SETTLE_MS);
   const html = await page.content();
   await ctx.close();
   return html;
@@ -109,6 +112,25 @@ async function drain() {
 // 工具：產生 ETag
 function makeETag(html){
   return `"W/${crypto.createHash('sha1').update(html).digest('hex')}"`;
+}
+
+async function sendRenderedResponse(req, res, html, target, asMarkdown, fromCache) {
+  const body = asMarkdown
+    ? (await import('markdown-for-agents')).convert(html, { baseUrl: target }).markdown
+    : html;
+  const etag = makeETag(body);
+
+  if (fromCache && req.headers['if-none-match'] === etag) {
+    res.statusCode = 304;
+    res.setHeader('ETag', etag);
+    res.setHeader('Cache-Control', `public, max-age=${Math.floor(CACHE_TTL_MS/1000)}`);
+    return res.end();
+  }
+
+  res.setHeader('Content-Type', asMarkdown ? 'text/markdown; charset=utf-8' : 'text/html; charset=utf-8');
+  res.setHeader('ETag', etag);
+  res.setHeader('Cache-Control', `public, max-age=${Math.floor(CACHE_TTL_MS/1000)}`);
+  res.end(body);
 }
 
 // 預熱
@@ -142,7 +164,8 @@ const server = http.createServer(async (req, res) => {
       const target = u.searchParams.get('url');
       if (!target) { res.statusCode = 400; return res.end('missing ?url='); }
       const existed = cache.del(target);
-      return res.end(existed ? 'OK PURGED' : 'MISS');
+      const markdownExisted = cache.del(markdownCacheKey(target));
+      return res.end(existed || markdownExisted ? 'OK PURGED' : 'MISS');
     }
 
     // 預熱：/prewarm?url=...
@@ -161,35 +184,21 @@ const server = http.createServer(async (req, res) => {
     if (!target) {
       res.statusCode = 400; return res.end('missing ?url=');
     }
+    const asMarkdown = ['1', 'true'].includes((u.searchParams.get('markdown') || '').toLowerCase());
 
     console.log(`Render request for: ${target}`);
 
     // 先查快取
-    const cached = cache.get(target);
+    const renderCacheKey = asMarkdown ? markdownCacheKey(target) : target;
+    const cached = cache.get(renderCacheKey);
     if (cached) {
-      // 支援 If-None-Match
-      const inm = req.headers['if-none-match'];
-      if (inm && inm === cached.etag) {
-        res.statusCode = 304;
-        res.setHeader('ETag', cached.etag);
-        res.setHeader('Cache-Control', `public, max-age=${Math.floor(CACHE_TTL_MS/1000)}`);
-        return res.end();
-      }
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.setHeader('ETag', cached.etag);
-      res.setHeader('Cache-Control', `public, max-age=${Math.floor(CACHE_TTL_MS/1000)}`);
-      return res.end(cached.html);
+      return sendRenderedResponse(req, res, cached.html, target, asMarkdown, true);
     }
 
     // 沒命中 -> 渲染
-    const html = await enqueue(() => render(target));
-    const etag = makeETag(html);
-    cache.set(target, { html, etag });
-
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('ETag', etag);
-    res.setHeader('Cache-Control', `public, max-age=${Math.floor(CACHE_TTL_MS/1000)}`);
-    res.end(html);
+    const html = await enqueue(() => render(target, asMarkdown));
+    cache.set(renderCacheKey, { html });
+    await sendRenderedResponse(req, res, html, target, asMarkdown, false);
 
   } catch (e) {
     res.statusCode = 500;

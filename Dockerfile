@@ -1,4 +1,4 @@
-FROM node:20-bullseye
+FROM node:22-bullseye
 
 # 安裝 Playwright 及 Firefox 依賴
 RUN npm i -g playwright && \
@@ -18,4 +18,3 @@ ENV PORT=3000 \
 
 EXPOSE 3000
 CMD ["node", "server.js"]
-
