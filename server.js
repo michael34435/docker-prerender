@@ -50,6 +50,7 @@ class LRUCache {
 }
 const cache = new LRUCache(CACHE_MAX_ENTRIES, CACHE_TTL_MS);
 const markdownCacheKey = (url) => `markdown:${url}`;
+const bodyCacheKey = (url) => `body:${url}`;
 
 // === Playwright 基礎 ===
 let browser;
@@ -62,7 +63,7 @@ async function ensureBrowser() {
   }
 }
 
-async function render(url, asMarkdown = false) {
+async function render(url, forceBody = false) {
   await ensureBrowser();
   const ctx = await browser.newContext({
     userAgent: 'Mozilla/5.0 (compatible; PlaywrightPrerender/1.1)',
@@ -77,7 +78,7 @@ async function render(url, asMarkdown = false) {
 
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: READY_TIMEOUT });
 
-  const ok = asMarkdown
+  const ok = forceBody
     ? await page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false)
     : await Promise.race([
       page.waitForFunction((sel) => {
@@ -91,7 +92,7 @@ async function render(url, asMarkdown = false) {
       page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false),
     ]);
 
-  if (ok || asMarkdown) await page.waitForTimeout(SETTLE_MS);
+  if (ok || forceBody) await page.waitForTimeout(SETTLE_MS);
   const html = await page.content();
   await ctx.close();
   return html;
@@ -165,7 +166,8 @@ const server = http.createServer(async (req, res) => {
       if (!target) { res.statusCode = 400; return res.end('missing ?url='); }
       const existed = cache.del(target);
       const markdownExisted = cache.del(markdownCacheKey(target));
-      return res.end(existed || markdownExisted ? 'OK PURGED' : 'MISS');
+      const bodyExisted = cache.del(bodyCacheKey(target));
+      return res.end(existed || markdownExisted || bodyExisted ? 'OK PURGED' : 'MISS');
     }
 
     // 預熱：/prewarm?url=...
@@ -185,18 +187,20 @@ const server = http.createServer(async (req, res) => {
       res.statusCode = 400; return res.end('missing ?url=');
     }
     const asMarkdown = ['1', 'true'].includes((u.searchParams.get('markdown') || '').toLowerCase());
+    const forceBody = ['1', 'true'].includes((u.searchParams.get('body') || '').toLowerCase());
+    const renderBody = asMarkdown || forceBody;
 
     console.log(`Render request for: ${target}`);
 
     // 先查快取
-    const renderCacheKey = asMarkdown ? markdownCacheKey(target) : target;
+    const renderCacheKey = asMarkdown ? markdownCacheKey(target) : forceBody ? bodyCacheKey(target) : target;
     const cached = cache.get(renderCacheKey);
     if (cached) {
       return sendRenderedResponse(req, res, cached.html, target, asMarkdown, true);
     }
 
     // 沒命中 -> 渲染
-    const html = await enqueue(() => render(target, asMarkdown));
+    const html = await enqueue(() => render(target, renderBody));
     cache.set(renderCacheKey, { html });
     await sendRenderedResponse(req, res, html, target, asMarkdown, false);
 
