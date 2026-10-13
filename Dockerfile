@@ -1,13 +1,13 @@
-FROM node:22-bullseye
-
-# 安裝 Playwright 及 Firefox 依賴
-RUN npm i -g playwright && \
-    npx playwright install --with-deps firefox
+FROM node:22-bookworm
 
 WORKDIR /app
-COPY . .
+COPY package.json package-lock.json ./
 
-RUN npm install
+# 依 lockfile 安裝 Playwright，並用同版本下載 Firefox 與系統依賴。
+RUN npm ci && \
+    npx playwright install --with-deps firefox
+
+COPY . .
 
 ENV PORT=3000 \
     READY_SELECTOR="#app *" \
