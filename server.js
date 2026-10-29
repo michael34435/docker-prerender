@@ -9,7 +9,7 @@ const BODY_READY_SELECTOR = process.env.BODY_READY_SELECTOR ?? 'article, main';
 const READY_TIMEOUT  = parseInt(process.env.READY_TIMEOUT || '15000', 10);
 const SETTLE_MS      = parseInt(process.env.SETTLE_MS || '200', 10);
 const CONCURRENCY    = parseInt(process.env.CONCURRENCY || '2', 10);
-const BLOCK_TYPES    = new Set((process.env.BLOCK_TYPES || 'image,media,font,stylesheet').split(',').map(s=>s.trim()));
+const BLOCK_TYPES    = new Set((process.env.BLOCK_TYPES || 'image,media,font').split(',').map(s=>s.trim()));
 
 // Cache 參數
 const CACHE_TTL_MS   = parseInt(process.env.CACHE_TTL_MS || '300000', 10); // 5 分鐘

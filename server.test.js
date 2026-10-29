@@ -24,6 +24,25 @@ async function renderer(t, env = {}) {
       setTimeout(() => res.end('Complete API article body'), 900);
       return;
     }
+    if (req.url === '/route-css') {
+      res.end(`<html><head><title>CSS route</title></head><body>
+        <div id="app"><main id="page-content"></main></div>
+        <script>
+          const stylesheet = document.createElement('link');
+          stylesheet.rel = 'stylesheet';
+          stylesheet.href = '/route.css';
+          stylesheet.onload = () => {
+            document.querySelector('#page-content').textContent = 'Rendered route body';
+          };
+          document.head.appendChild(stylesheet);
+        </script></body></html>`);
+      return;
+    }
+    if (req.url === '/route.css') {
+      res.setHeader('Content-Type', 'text/css');
+      res.end('body { color: red; }');
+      return;
+    }
     res.setHeader('Content-Type', 'text/html');
     if (req.url === '/loading-article') {
       res.end(`<html><head><title>Preloaded title</title></head><body>
@@ -153,6 +172,14 @@ test('pages without an article or main still complete through network idle', asy
   const { render, url } = await renderer(t);
 
   assert.match(await render(url, true), /Generic page content/);
+});
+
+test('a CSS-dependent route renders after its stylesheet loads', async t => {
+  const { render, url } = await renderer(t);
+
+  const html = await render(`${url}/route-css`, true);
+
+  assert.match(html, /<main id="page-content">Rendered route body<\/main>/);
 });
 
 test('an empty body selector waits for the API body even when an article heading is present', async t => {

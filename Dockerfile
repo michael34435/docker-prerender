@@ -14,7 +14,7 @@ ENV PORT=3000 \
     READY_TIMEOUT=15000 \
     SETTLE_MS=200 \
     CONCURRENCY=2 \
-    BLOCK_TYPES="image,media,font,stylesheet"
+    BLOCK_TYPES="image,media,font"
 
 EXPOSE 3000
 CMD ["node", "server.js"]
