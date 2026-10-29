@@ -5,6 +5,7 @@ const { firefox } = require('playwright');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const READY_SELECTOR = process.env.READY_SELECTOR || '#app *';
+const BODY_READY_SELECTOR = process.env.BODY_READY_SELECTOR ?? 'article, main';
 const READY_TIMEOUT  = parseInt(process.env.READY_TIMEOUT || '15000', 10);
 const SETTLE_MS      = parseInt(process.env.SETTLE_MS || '200', 10);
 const CONCURRENCY    = parseInt(process.env.CONCURRENCY || '2', 10);
@@ -54,48 +55,55 @@ const bodyCacheKey = (url) => `body:${url}`;
 
 // === Playwright 基礎 ===
 let browser;
+let browserLaunch;
 const queue = [];
 let running = 0;
 
 async function ensureBrowser() {
-  if (!browser) {
-    browser = await firefox.launch({ headless: true, args: ['--no-sandbox'] });
+  if (browser?.isConnected()) return browser;
+  if (!browserLaunch) {
+    browserLaunch = firefox.launch({ headless: true, args: ['--no-sandbox'] })
+      .then(instance => (browser = instance))
+      .finally(() => { browserLaunch = undefined; });
   }
+  return browserLaunch;
 }
 
 async function render(url, forceBody = false) {
-  await ensureBrowser();
-  const ctx = await browser.newContext({
+  const activeBrowser = await ensureBrowser();
+  const ctx = await activeBrowser.newContext({
     userAgent: 'Mozilla/5.0 (compatible; PlaywrightPrerender/1.1)',
   });
-  const page = await ctx.newPage();
+  try {
+    const page = await ctx.newPage();
 
-  await page.route('**/*', (route) => {
-    const req = route.request();
-    if (BLOCK_TYPES.has(req.resourceType())) return route.abort();
-    return route.continue();
-  });
+    await page.route('**/*', (route) => {
+      const req = route.request();
+      if (BLOCK_TYPES.has(req.resourceType())) return route.abort();
+      return route.continue();
+    });
 
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: READY_TIMEOUT });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: READY_TIMEOUT });
 
-  const ok = forceBody
-    ? await page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false)
-    : await Promise.race([
-      page.waitForFunction((sel) => {
+    const ok = await Promise.any([
+      page.waitForFunction(({ selector, forceBody }) => {
+        if (forceBody) {
+          return !!selector && Array.from(document.querySelectorAll(selector))
+            .some(element => (element.textContent || '').trim().length > 0);
+        }
         const title = (document.querySelector('title')?.textContent || document.title || '').trim();
-        console.log(`Detected title: "${title}"`);
         if (title.length > 0) return true;
         const app = document.querySelector('#app');
-        console.log(`Detected app element: ${app ? 'YES' : 'NO'}`);
-        return !!app && (app.children.length > 0 || !!document.querySelector(sel));
-      }, READY_SELECTOR, { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false),
-      page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true).catch(()=>false),
-    ]);
+        return !!app && (app.children.length > 0 || !!document.querySelector(selector));
+      }, { selector: forceBody ? BODY_READY_SELECTOR : READY_SELECTOR, forceBody }, { timeout: READY_TIMEOUT }).then(()=>true),
+      page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true),
+    ]).catch(()=>false);
 
-  if (ok || forceBody) await page.waitForTimeout(SETTLE_MS);
-  const html = await page.content();
-  await ctx.close();
-  return html;
+    if (ok || forceBody) await page.waitForTimeout(SETTLE_MS);
+    return await page.content();
+  } finally {
+    await ctx.close();
+  }
 }
 
 // 併發隊列
