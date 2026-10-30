@@ -1,6 +1,7 @@
 // server.js
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
 const { firefox } = require('playwright');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -8,84 +9,201 @@ const READY_SELECTOR = process.env.READY_SELECTOR || '#app *';
 const BODY_READY_SELECTOR = process.env.BODY_READY_SELECTOR ?? 'article, main';
 const READY_TIMEOUT  = parseInt(process.env.READY_TIMEOUT || '15000', 10);
 const SETTLE_MS      = parseInt(process.env.SETTLE_MS || '200', 10);
-const CONCURRENCY    = parseInt(process.env.CONCURRENCY || '2', 10);
+const RENDER_TIMEOUT_MS = parseInt(process.env.RENDER_TIMEOUT_MS || '20000', 10);
+const CONTEXT_CLOSE_TIMEOUT_MS = 1500;
+const MEMORY_CHECK_INTERVAL_MS = 100;
+const RENDER_MEMORY_LIMIT_BYTES = parseInt(process.env.RENDER_MEMORY_LIMIT_MB || '450', 10) * 1024 * 1024;
+const RENDER_MEMORY_RESUME_BYTES = parseInt(process.env.RENDER_MEMORY_RESUME_MB || '400', 10) * 1024 * 1024;
+const CONCURRENCY    = parseInt(process.env.CONCURRENCY || '1', 10);
 const BLOCK_TYPES    = new Set((process.env.BLOCK_TYPES || 'image,media,font').split(',').map(s=>s.trim()));
 
 // Cache 參數
 const CACHE_TTL_MS   = parseInt(process.env.CACHE_TTL_MS || '300000', 10); // 5 分鐘
 const CACHE_MAX_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES || '1000', 10);
+const CACHE_MAX_BYTES = parseInt(process.env.CACHE_MAX_BYTES || String(32 * 1024 * 1024), 10);
+const CACHE_MAX_ENTRY_BYTES = parseInt(process.env.CACHE_MAX_ENTRY_BYTES || String(1024 * 1024), 10);
 
 // === 極簡 LRU + TTL ===
 class LRUCache {
-  constructor(maxEntries, ttl) {
+  constructor(maxEntries, ttl, maxBytes, maxEntryBytes) {
     this.max = maxEntries; this.ttl = ttl;
+    this.maxBytes = maxBytes; this.maxEntryBytes = maxEntryBytes;
+    this.bytes = 0;
     this.map = new Map(); // key -> { html, etag, ts, hits }
   }
   _isExpired(entry){ return (Date.now() - entry.ts) > this.ttl; }
+  _remove(key){
+    const entry = this.map.get(key);
+    if (!entry) return false;
+    this.map.delete(key);
+    this.bytes -= entry.bytes;
+    return true;
+  }
+  _pruneExpired(){
+    for (const [key, entry] of this.map) {
+      if (this._isExpired(entry)) this._remove(key);
+    }
+  }
   get(key){
     const e = this.map.get(key);
     if (!e) return null;
-    if (this._isExpired(e)) { this.map.delete(key); return null; }
+    if (this._isExpired(e)) { this._remove(key); return null; }
     // LRU：移到最後
     this.map.delete(key); this.map.set(key, e);
     e.hits = (e.hits||0)+1;
     return e;
   }
   set(key, val){
-    if (this.map.has(key)) this.map.delete(key);
-    this.map.set(key, { ...val, ts: Date.now(), hits: 0 });
-    // 超過容量，踢掉最舊
-    while (this.map.size > this.max) {
+    this._pruneExpired();
+    const bytes = Buffer.byteLength(val.html, 'utf8');
+    if (bytes > this.maxEntryBytes || bytes > this.maxBytes) return false;
+    this._remove(key);
+    this.map.set(key, { ...val, ts: Date.now(), hits: 0, bytes });
+    this.bytes += bytes;
+    // 超過項目數或位元組上限，踢掉最舊項目
+    while (this.map.size > this.max || this.bytes > this.maxBytes) {
       const oldestKey = this.map.keys().next().value;
-      this.map.delete(oldestKey);
+      this._remove(oldestKey);
     }
+    return true;
   }
-  del(key){ return this.map.delete(key); }
+  del(key){ return this._remove(key); }
   has(key){ return !!this.get(key); }
   stats(){
-    let size = 0;
-    for (const v of this.map.values()) size += Buffer.byteLength(v.html, 'utf8');
-    return { entries: this.map.size, approxBytes: size, ttlMs: this.ttl, max: this.max };
+    this._pruneExpired();
+    return { entries: this.map.size, approxBytes: this.bytes, ttlMs: this.ttl, max: this.max, maxBytes: this.maxBytes };
   }
   keys(){ return [...this.map.keys()]; }
 }
-const cache = new LRUCache(CACHE_MAX_ENTRIES, CACHE_TTL_MS);
+const cache = new LRUCache(CACHE_MAX_ENTRIES, CACHE_TTL_MS, CACHE_MAX_BYTES, CACHE_MAX_ENTRY_BYTES);
 const markdownCacheKey = (url) => `markdown:${url}`;
 const bodyCacheKey = (url) => `body:${url}`;
 
 // === Playwright 基礎 ===
 let browser;
 let browserLaunch;
-const queue = [];
+let cleanupPending = false;
+let memoryPressure = false;
 let running = 0;
+
+function timeoutError(message = `Render exceeded ${RENDER_TIMEOUT_MS}ms`) {
+  const error = new Error(message);
+  error.statusCode = 504;
+  error.rendererTimeout = true;
+  return error;
+}
+
+function remaining(deadline) {
+  return Math.max(1, deadline - Date.now());
+}
+
+function withDeadline(promise, deadline) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(timeoutError()), remaining(deadline));
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function withRenderGuard(promise, deadline, memoryGuard) {
+  return Promise.race([withDeadline(promise, deadline), memoryGuard]);
+}
+
+function updateMemoryPressure() {
+  let memoryBytes;
+  try {
+    memoryBytes = Number(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
+  } catch {
+    return false;
+  }
+  if (!Number.isFinite(memoryBytes) || memoryBytes <= 0) return false;
+
+  try {
+    const memoryStat = fs.readFileSync('/sys/fs/cgroup/memory.stat', 'utf8');
+    const inactiveFile = memoryStat.match(/^inactive_file\s+(\d+)$/m);
+    if (inactiveFile) memoryBytes = Math.max(0, memoryBytes - Number(inactiveFile[1]));
+  } catch {}
+
+  if (memoryPressure) {
+    if (memoryBytes <= RENDER_MEMORY_RESUME_BYTES) memoryPressure = false;
+  } else if (memoryBytes >= RENDER_MEMORY_LIMIT_BYTES) {
+    memoryPressure = true;
+  }
+  return memoryPressure;
+}
+
+function memoryLimitError() {
+  const error = new Error('Renderer memory limit reached');
+  error.statusCode = 503;
+  error.memoryPressure = true;
+  return error;
+}
 
 async function ensureBrowser() {
   if (browser?.isConnected()) return browser;
   if (!browserLaunch) {
-    browserLaunch = firefox.launch({ headless: true, args: ['--no-sandbox'] })
-      .then(instance => (browser = instance))
+    browserLaunch = firefox.launch({
+      headless: true,
+      args: ['--no-sandbox'],
+      firefoxUserPrefs: {
+        'dom.ipc.processCount': 1,
+        'browser.cache.memory.capacity': 16384,
+        'browser.cache.disk.enable': false,
+        'browser.sessionhistory.max_total_viewers': 0,
+      },
+      timeout: RENDER_TIMEOUT_MS,
+    })
+      .then(instance => {
+        browser = instance;
+        return instance;
+      })
       .finally(() => { browserLaunch = undefined; });
   }
   return browserLaunch;
 }
 
 async function render(url, forceBody = false) {
-  const activeBrowser = await ensureBrowser();
-  const ctx = await activeBrowser.newContext({
-    userAgent: 'Mozilla/5.0 (compatible; PlaywrightPrerender/1.1)',
-  });
-  try {
-    const page = await ctx.newPage();
+  const deadline = Date.now() + RENDER_TIMEOUT_MS;
+  let activeBrowser;
+  let ctx;
+  let page;
+  let html;
+  let failure;
+  let memoryMonitor;
+  let rejectMemoryGuard;
+  let memoryGuardTriggered = false;
+  const memoryGuard = new Promise((_, reject) => { rejectMemoryGuard = reject; });
 
-    await page.route('**/*', (route) => {
+  const guardMemory = () => {
+    const pressure = updateMemoryPressure();
+    if (memoryGuardTriggered || !pressure) return;
+    memoryGuardTriggered = true;
+    rejectMemoryGuard(memoryLimitError());
+  };
+
+  try {
+    if (updateMemoryPressure()) throw memoryLimitError();
+    memoryMonitor = setInterval(guardMemory, MEMORY_CHECK_INTERVAL_MS);
+    activeBrowser = await withRenderGuard(ensureBrowser(), deadline, memoryGuard);
+    ctx = await withRenderGuard(activeBrowser.newContext({
+      userAgent: 'Mozilla/5.0 (compatible; PlaywrightPrerender/1.1)',
+    }), deadline, memoryGuard);
+    page = await withRenderGuard(ctx.newPage(), deadline, memoryGuard);
+
+    await withRenderGuard(page.route('**/*', (route) => {
       const req = route.request();
       if (BLOCK_TYPES.has(req.resourceType())) return route.abort();
       return route.continue();
-    });
+    }), deadline, memoryGuard);
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: READY_TIMEOUT });
+    await withRenderGuard(page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: Math.min(READY_TIMEOUT, remaining(deadline)),
+    }), deadline, memoryGuard);
 
-    const ok = await Promise.any([
+    const ok = await withRenderGuard(Promise.any([
       page.waitForFunction(({ selector, forceBody }) => {
         if (forceBody) {
           return !!selector && Array.from(document.querySelectorAll(selector))
@@ -95,27 +213,81 @@ async function render(url, forceBody = false) {
         if (title.length > 0) return true;
         const app = document.querySelector('#app');
         return !!app && (app.children.length > 0 || !!document.querySelector(selector));
-      }, { selector: forceBody ? BODY_READY_SELECTOR : READY_SELECTOR, forceBody }, { timeout: READY_TIMEOUT }).then(()=>true),
-      page.waitForLoadState('networkidle', { timeout: READY_TIMEOUT }).then(()=>true),
-    ]).catch(()=>false);
+      }, { selector: forceBody ? BODY_READY_SELECTOR : READY_SELECTOR, forceBody }, {
+        timeout: Math.min(READY_TIMEOUT, remaining(deadline)),
+      }).then(()=>true),
+      page.waitForLoadState('networkidle', {
+        timeout: Math.min(READY_TIMEOUT, remaining(deadline)),
+      }).then(()=>true),
+    ]).catch(()=>false), deadline, memoryGuard);
 
-    if (ok || forceBody) await page.waitForTimeout(SETTLE_MS);
-    return await page.content();
+    if (ok || forceBody) {
+      await withRenderGuard(page.waitForTimeout(Math.min(SETTLE_MS, remaining(deadline))), deadline, memoryGuard);
+    }
+    html = await withRenderGuard(page.content(), deadline, memoryGuard);
+  } catch (error) {
+    failure = error;
+    if (error.name === 'TimeoutError' || /timed out|timeout/i.test(error.message || '')) {
+      error.statusCode = 504;
+      error.rendererTimeout = true;
+    }
   } finally {
-    await ctx.close();
+    if (memoryMonitor) clearInterval(memoryMonitor);
+    if (ctx) {
+      let timer;
+      const cleanupDeadline = Date.now() + CONTEXT_CLOSE_TIMEOUT_MS;
+      try {
+        if (page && !page.isClosed()) {
+          await withDeadline(page.close({ runBeforeUnload: false }), cleanupDeadline);
+        }
+      } catch {}
+
+      const contextClose = Promise.resolve().then(() => ctx.close());
+      const closed = await Promise.race([
+        contextClose.then(() => true, () => false),
+        new Promise(resolve => {
+          timer = setTimeout(() => resolve(false), Math.max(1, cleanupDeadline - Date.now()));
+        }),
+      ]);
+      clearTimeout(timer);
+
+      if (!closed) {
+        cleanupPending = true;
+        const releaseOnDisconnect = () => { cleanupPending = false; };
+        activeBrowser?.once('disconnected', releaseOnDisconnect);
+        contextClose.then(
+          () => {
+            cleanupPending = false;
+            activeBrowser?.off('disconnected', releaseOnDisconnect);
+          },
+          () => {
+            if (!activeBrowser?.isConnected()) {
+              cleanupPending = false;
+              activeBrowser?.off('disconnected', releaseOnDisconnect);
+            }
+          },
+        );
+        failure ||= timeoutError('Firefox page context did not close in time');
+      }
+    }
   }
+
+  if (failure) throw failure;
+  return html;
 }
 
-// 併發隊列
+// Fail fast under load so renderer calls cannot occupy every application worker.
 function enqueue(fn) {
-  return new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); drain(); });
-}
-async function drain() {
-  if (running >= CONCURRENCY || queue.length === 0) return;
-  const item = queue.shift(); running++;
-  try { item.resolve(await item.fn()); }
-  catch (e) { item.reject(e); }
-  finally { running--; drain(); }
+  if (updateMemoryPressure() || cleanupPending || running >= CONCURRENCY) {
+    const message = memoryPressure ? 'Renderer memory limit reached'
+      : cleanupPending ? 'Previous page is still closing' : 'Renderer is busy';
+    const error = new Error(message);
+    error.statusCode = 503;
+    return Promise.reject(error);
+  }
+
+  running++;
+  return Promise.resolve().then(fn).finally(() => { running--; });
 }
 
 // 工具：產生 ETag
@@ -213,8 +385,9 @@ const server = http.createServer(async (req, res) => {
     await sendRenderedResponse(req, res, html, target, asMarkdown, false);
 
   } catch (e) {
-    res.statusCode = 500;
-    res.end(`Render error: ${e.message || e}`);
+    res.statusCode = e.statusCode || 500;
+    const body = `Render error: ${e.message || e}`;
+    res.end(body);
   }
 });
 
